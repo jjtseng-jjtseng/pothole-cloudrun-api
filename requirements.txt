@@ -1,12 +1,8 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-
-# YOLO / vision
-ultralytics
-opencv-python-headless
-
-# Utilities you explicitly use
+fastapi
+uvicorn[standard]
 requests
 polyline
 pillow
 numpy
+ultralytics
+opencv-python-headless
