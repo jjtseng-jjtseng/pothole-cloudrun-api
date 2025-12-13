@@ -1,0 +1,23 @@
+steps:
+  # Build the Docker image from Dockerfile in repo root
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/pothole-api:$COMMIT_SHA", "."]
+
+  # Push it
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push", "gcr.io/$PROJECT_ID/pothole-api:$COMMIT_SHA"]
+
+  # Deploy to Cloud Run (us-east4)
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "gcloud"
+    args:
+      [
+        "run", "deploy", "pothole-api",
+        "--image", "gcr.io/$PROJECT_ID/pothole-api:$COMMIT_SHA",
+        "--region", "us-east4",
+        "--platform", "managed",
+        "--port", "8080",
+        "--allow-unauthenticated"
+      ]
+images:
+  - "gcr.io/$PROJECT_ID/pothole-api:$COMMIT_SHA"
