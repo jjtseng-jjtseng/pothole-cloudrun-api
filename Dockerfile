@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements.txt .
+COPY best.pt /app/best.pt
+ENV MODEL_PATH=/app/best.pt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
