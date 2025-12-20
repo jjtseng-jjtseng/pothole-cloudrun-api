@@ -1,191 +1,264 @@
+# main.py
 import os
 import math
-from typing import List, Dict, Any, Optional
+import time
+import uuid
+import tempfile
+from typing import List, Optional, Dict, Any, Tuple
 
 import requests
-import polyline
+import polyline as polyline_lib
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# YOLO (Ultralytics)
+# NOTE: ultralytics imports cv2 internally
 from ultralytics import YOLO
-import numpy as np
-import cv2
 
-app = FastAPI()
 
-# --- Config via env vars (set these in Cloud Run) ---
+# ----------------------------
+# Config
+# ----------------------------
 GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")
-MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")  # put best.pt in repo root or download it at startup
-CONF_THRESH = float(os.environ.get("CONF_THRESH", "0.35"))
+MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
 
-# Keep this low at first so it doesn't time out
-MAX_POINTS = int(os.environ.get("MAX_POINTS", "60"))          # max Street View images per request
-SAMPLE_EVERY_N = int(os.environ.get("SAMPLE_EVERY_N", "3"))   # take every Nth route point
-STREETVIEW_SIZE = os.environ.get("STREETVIEW_SIZE", "640x640")
-FOV = int(os.environ.get("STREETVIEW_FOV", "90"))
-PITCH = int(os.environ.get("STREETVIEW_PITCH", "-15"))
-
-if not GOOGLE_MAPS_KEY:
-    print("WARNING: GOOGLE_MAPS_KEY is not set.")
-
-# Load YOLO once at startup (important for speed)
-model: Optional[YOLO] = None
-
-@app.on_event("startup")
-def _startup():
-    global model
-    try:
-        model = YOLO(MODEL_PATH)
-        print(f"Loaded model from {MODEL_PATH}")
-    except Exception as e:
-        print(f"ERROR loading model: {e}")
-        model = None
+# Safety/perf limits (so one request can't explode your bill)
+DEFAULT_SAMPLE_METERS = 30
+MAX_POINTS = 200          # hard cap of sampled points
+STREETVIEW_SIZE = "640x640"
+STREETVIEW_FOV = 90
+STREETVIEW_PITCH = -10
+CONF_THRES = 0.45         # tweak as needed
 
 
-class RoutePutRequest(BaseModel):
-    Curr_Lat: float
-    Curr_Lng: float
-    Dest_Lat: float
-    Dest_Lng: float
+# ----------------------------
+# App + model
+# ----------------------------
+app = FastAPI(title="Pothole Route Scanner API", version="1.0.0")
+
+_model: Optional[YOLO] = None
 
 
+def get_model() -> YOLO:
+    global _model
+    if _model is None:
+        if not os.path.exists(MODEL_PATH):
+            raise RuntimeError(
+                f"MODEL_PATH not found: '{MODEL_PATH}'. "
+                "Make sure best.pt is in the container and MODEL_PATH points to it."
+            )
+        _model = YOLO(MODEL_PATH)
+    return _model
+
+
+# ----------------------------
+# Request/response schemas
+# ----------------------------
+class RouteScanRequest(BaseModel):
+    # Option A: send start/end
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+    end_lat: Optional[float] = None
+    end_lng: Optional[float] = None
+
+    # Option B: send a polyline directly (Google encoded polyline string)
+    polyline: Optional[str] = None
+
+    # Sampling distance along the route
+    sample_meters: int = Field(default=DEFAULT_SAMPLE_METERS, ge=5, le=200)
+
+    # Optional knobs
+    max_points: int = Field(default=MAX_POINTS, ge=10, le=MAX_POINTS)
+    confidence: float = Field(default=CONF_THRES, ge=0.01, le=0.99)
+
+
+class PotholeHit(BaseModel):
+    lat: float
+    lng: float
+    confidence: float
+    cls: int
+    class_name: str
+    heading: Optional[float] = None
+    image_id: Optional[str] = None
+
+
+class RouteScanResponse(BaseModel):
+    count: int
+    potholes: List[PotholeHit]
+    route_points_sampled: int
+    sampled_points: List[Dict[str, float]]  # list of {"lat":..., "lng":...} so MIT can show “waypoints”
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compass bearing 0..360 from (lat1,lon1) to (lat2,lon2)."""
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360.0) % 360.0
+
+
+def sample_route_points(coords: List[Tuple[float, float]], every_m: int, max_points: int) -> List[Tuple[float, float]]:
+    """Downsample polyline coords to ~every_m meters."""
+    if not coords:
+        return []
+    sampled = [coords[0]]
+    accum = 0.0
+    for i in range(1, len(coords)):
+        if len(sampled) >= max_points:
+            break
+        lat1, lon1 = coords[i - 1]
+        lat2, lon2 = coords[i]
+        d = haversine_m(lat1, lon1, lat2, lon2)
+        accum += d
+        if accum >= every_m:
+            sampled.append((lat2, lon2))
+            accum = 0.0
+    if len(sampled) < max_points and coords[-1] != sampled[-1]:
+        sampled.append(coords[-1])
+    return sampled[:max_points]
+
+
+def get_polyline_from_google(start_lat: float, start_lng: float, end_lat: float, end_lng: float) -> str:
+    if not GOOGLE_MAPS_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_KEY env var not set on Cloud Run.")
+    url = "https://maps.googleapis.com/maps/api/directions/json"
+    params = {
+        "origin": f"{start_lat},{start_lng}",
+        "destination": f"{end_lat},{end_lng}",
+        "mode": "driving",
+        "key": GOOGLE_MAPS_KEY,
+    }
+    r = requests.get(url, params=params, timeout=25)
+    data = r.json()
+    if data.get("status") != "OK":
+        raise HTTPException(status_code=400, detail=f"Directions API error: {data.get('status')} {data.get('error_message','')}".strip())
+    return data["routes"][0]["overview_polyline"]["points"]
+
+
+def download_streetview_image(lat: float, lng: float, heading: Optional[float], out_path: str) -> None:
+    if not GOOGLE_MAPS_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_KEY env var not set on Cloud Run.")
+    url = "https://maps.googleapis.com/maps/api/streetview"
+    params = {
+        "size": STREETVIEW_SIZE,
+        "location": f"{lat},{lng}",
+        "fov": str(STREETVIEW_FOV),
+        "pitch": str(STREETVIEW_PITCH),
+        "key": GOOGLE_MAPS_KEY,
+    }
+    if heading is not None:
+        params["heading"] = str(heading)
+
+    resp = requests.get(url, params=params, timeout=30)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Street View download failed HTTP {resp.status_code}")
+    # If Google returns an error image sometimes it’s still 200; keep it simple for now.
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+
+
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Pothole API running. Use /docs"}
-
-
-def calculate_heading(lat1, lon1, lat2, lon2) -> float:
-    lat1 = math.radians(lat1)
-    lon1 = math.radians(lon1)
-    lat2 = math.radians(lat2)
-    lon2 = math.radians(lon2)
-
-    dlon = lon2 - lon1
-    x = math.sin(dlon) * math.cos(lat2)
-    y = math.cos(lat1) * math.sin(lat2) - (math.sin(lat1) * math.cos(lat2) * math.cos(dlon))
-    bearing = math.degrees(math.atan2(x, y))
-    return (bearing + 360) % 360
-
-
-def get_route_points(origin_lat, origin_lng, dest_lat, dest_lng) -> List[List[float]]:
-    if not GOOGLE_MAPS_KEY:
-        raise HTTPException(status_code=500, detail="Server missing GOOGLE_MAPS_KEY")
-
-    url = (
-        "https://maps.googleapis.com/maps/api/directions/json"
-        f"?origin={origin_lat},{origin_lng}"
-        f"&destination={dest_lat},{dest_lng}"
-        f"&mode=driving"
-        f"&key={GOOGLE_MAPS_KEY}"
-    )
-    r = requests.get(url, timeout=20)
-    data = r.json()
-
-    if data.get("status") != "OK":
-        raise HTTPException(status_code=400, detail=f"Directions API error: {data.get('status')}")
-
-    route = data["routes"][0]
-    polyline_points = route["overview_polyline"]["points"]
-    coords = polyline.decode(polyline_points)  # list of (lat, lng)
-    return [[float(a), float(b)] for a, b in coords]
-
-
-def fetch_streetview_image(lat, lng, heading) -> np.ndarray:
-    # Street View Static API (image bytes)
-    url = (
-        "https://maps.googleapis.com/maps/api/streetview"
-        f"?size={STREETVIEW_SIZE}"
-        f"&location={lat},{lng}"
-        f"&fov={FOV}"
-        f"&heading={heading}"
-        f"&pitch={PITCH}"
-        f"&key={GOOGLE_MAPS_KEY}"
-    )
-    r = requests.get(url, timeout=25)
-    if r.status_code != 200:
-        raise RuntimeError(f"Street View HTTP {r.status_code}")
-
-    # Decode JPEG bytes into image array (BGR)
-    img_arr = np.frombuffer(r.content, dtype=np.uint8)
-    img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise RuntimeError("Failed to decode image")
-    return img
-
-
-def run_yolo(img_bgr: np.ndarray) -> List[Dict[str, Any]]:
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model not loaded on server")
-
-    # Ultralytics can accept numpy arrays
-    results = model.predict(source=img_bgr, conf=CONF_THRESH, verbose=False)
-    out = []
-
-    for res in results:
-        names = res.names  # class id -> name
-        if res.boxes is None:
-            continue
-        for b in res.boxes:
-            cls = int(b.cls[0].item())
-            conf = float(b.conf[0].item())
-            out.append({
-                "class_id": cls,
-                "class_name": names.get(cls, str(cls)),
-                "conf": conf
-            })
-    return out
-
-
-@app.put("/scan_route")
-def scan_route(req: RoutePutRequest):
-    # 1) Get route points
-    coords = get_route_points(req.Curr_Lat, req.Curr_Lng, req.Dest_Lat, req.Dest_Lng)
-
-    if len(coords) < 2:
-        return {"hazards": [], "detail": "Route too short"}
-
-    # 2) Sample points so it doesn't explode in time/cost
-    sampled = coords[::max(1, SAMPLE_EVERY_N)]
-    if len(sampled) > MAX_POINTS:
-        sampled = sampled[:MAX_POINTS]
-
-    hazards = []
-    scanned = 0
-
-    # 3) For each sampled point, compute heading using next point (if possible)
-    for i in range(len(sampled)):
-        lat1, lon1 = sampled[i]
-        if i < len(sampled) - 1:
-            lat2, lon2 = sampled[i + 1]
-        else:
-            lat2, lon2 = sampled[i - 1]  # fallback
-
-        heading = calculate_heading(lat1, lon1, lat2, lon2)
-
-        try:
-            img = fetch_streetview_image(lat1, lon1, heading)
-            dets = run_yolo(img)
-            scanned += 1
-
-            # If any detections, record this coordinate as a hazard point
-            for d in dets:
-                hazards.append({
-                    "lat": lat1,
-                    "lng": lon1,
-                    "type": d["class_name"],   # you can map this to "pothole"/"manhole" etc
-                    "conf": d["conf"]
-                })
-
-        except Exception as e:
-            # skip bad points but continue
-            continue
-
     return {
-        "hazards": hazards,
-        "meta": {
-            "route_points": len(coords),
-            "sampled_points": len(sampled),
-            "scanned_images": scanned
-        }
+        "ok": True,
+        "message": "Pothole API running. Use POST /scan_route",
+        "endpoints": ["/docs", "/openapi.json", "/scan_route"],
     }
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.post("/scan_route", response_model=RouteScanResponse)
+def scan_route(req: RouteScanRequest):
+    # 1) Get polyline
+    poly = req.polyline
+    if not poly:
+        # require start/end
+        if None in (req.start_lat, req.start_lng, req.end_lat, req.end_lng):
+            raise HTTPException(
+                status_code=422,
+                detail="Provide either 'polyline' OR all of: start_lat, start_lng, end_lat, end_lng.",
+            )
+        poly = get_polyline_from_google(req.start_lat, req.start_lng, req.end_lat, req.end_lng)
+
+    # 2) Decode to coords and sample
+    coords = polyline_lib.decode(poly)  # [(lat,lng), ...]
+    if len(coords) < 2:
+        raise HTTPException(status_code=400, detail="Polyline decoded to fewer than 2 points.")
+
+    sampled = sample_route_points(coords, every_m=req.sample_meters, max_points=req.max_points)
+    if len(sampled) < 1:
+        raise HTTPException(status_code=400, detail="No sampled points generated.")
+
+    # 3) Run Street View + YOLO, mapping detections -> the (lat,lng) where the image was taken
+    model = get_model()
+    potholes: List[PotholeHit] = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, (lat, lng) in enumerate(sampled):
+            # heading toward next point (optional but helps consistency)
+            heading = None
+            if i < len(sampled) - 1:
+                lat2, lng2 = sampled[i + 1]
+                heading = bearing_deg(lat, lng, lat2, lng2)
+
+            image_id = f"{i}_{uuid.uuid4().hex[:8]}"
+            img_path = os.path.join(tmpdir, f"sv_{image_id}.jpg")
+
+            download_streetview_image(lat, lng, heading, img_path)
+
+            # Ultralytics predict
+            results = model.predict(source=img_path, conf=req.confidence, verbose=False)
+
+            # If any box appears, treat that coordinate as a hazard “waypoint”
+            for r in results:
+                names = r.names or {}
+                if r.boxes is None or len(r.boxes) == 0:
+                    continue
+                for b in r.boxes:
+                    conf = float(b.conf.item()) if hasattr(b.conf, "item") else float(b.conf)
+                    cls = int(b.cls.item()) if hasattr(b.cls, "item") else int(b.cls)
+                    class_name = str(names.get(cls, cls))
+
+                    potholes.append(
+                        PotholeHit(
+                            lat=float(lat),
+                            lng=float(lng),
+                            confidence=conf,
+                            cls=cls,
+                            class_name=class_name,
+                            heading=float(heading) if heading is not None else None,
+                            image_id=image_id,
+                        )
+                    )
+
+    # 4) Return: pothole “waypoints” + the sampled route points (so MIT can compare along navigation)
+    sampled_points_payload = [{"lat": float(a), "lng": float(b)} for (a, b) in sampled]
+
+    return RouteScanResponse(
+        count=len(potholes),
+        potholes=potholes,
+        route_points_sampled=len(sampled),
+        sampled_points=sampled_points_payload,
+    )
