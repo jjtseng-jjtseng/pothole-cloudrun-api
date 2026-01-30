@@ -32,8 +32,7 @@ CONF_THRES = 0.45         # tweak as needed
 
 # Firebase RTDB (public in your case)
 FIREBASE_DB_URL = os.environ.get(
-    "FIREBASE_DB_URL",
-    "https://deepdrive-detect-default-rtdb.firebaseio.com"
+    "FIREBASE_DB_URL"
 ).rstrip("/")
 FIREBASE_ROOT_NODE = os.environ.get("FIREBASE_ROOT_NODE", "detectRoundChunk")
 
