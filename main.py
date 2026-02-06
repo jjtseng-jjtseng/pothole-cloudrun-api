@@ -1,7 +1,6 @@
 # main.py
 import os
 import math
-import time
 import uuid
 import tempfile
 from typing import List, Optional, Dict, Any, Tuple
@@ -31,9 +30,8 @@ STREETVIEW_PITCH = -10
 CONF_THRES = 0.45         # tweak as needed
 
 # Firebase RTDB (public in your case)
-FIREBASE_DB_URL = os.environ.get(
-    "FIREBASE_DB_URL"
-).rstrip("/")
+# IMPORTANT: default to "" so .rstrip doesn't crash if env var is missing
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "").rstrip("/")
 FIREBASE_ROOT_NODE = os.environ.get("FIREBASE_ROOT_NODE", "detectRoundChunk")
 
 # Only upload detections >= 0.60 confidence
@@ -42,8 +40,6 @@ FIREBASE_MIN_CONF = float(os.environ.get("FIREBASE_MIN_CONF", "0.60"))
 # Formatting to match your screenshot
 LOCATION_DECIMALS = int(os.environ.get("LOCATION_DECIMALS", "5"))  # "40.40988, -74.54944"
 CHUNK_DECIMALS = int(os.environ.get("CHUNK_DECIMALS", "1"))        # "40@4"
-# If a new detection is within this many meters of an existing entry (same class), increment ReportCount
-DUPLICATE_RADIUS_M = float(os.environ.get("DUPLICATE_RADIUS_M", "10"))
 
 # Timeout for Firebase REST calls
 FIREBASE_TIMEOUT_S = float(os.environ.get("FIREBASE_TIMEOUT_S", "10"))
@@ -216,16 +212,6 @@ def _location_string(lat: float, lng: float) -> str:
     return f"{lat:.{LOCATION_DECIMALS}f}, {lng:.{LOCATION_DECIMALS}f}"
 
 
-def _parse_location_string(loc: str) -> Optional[Tuple[float, float]]:
-    try:
-        parts = [p.strip() for p in str(loc).split(",")]
-        if len(parts) != 2:
-            return None
-        return float(parts[0]), float(parts[1])
-    except Exception:
-        return None
-
-
 def _fb_url(*parts: str) -> str:
     # Encode each path segment safely for Firebase REST URLs
     encoded = "/".join(quote(p, safe="") for p in parts)
@@ -245,12 +231,6 @@ def _firebase_put(path_parts: List[str], payload: Dict[str, Any]) -> None:
     r.raise_for_status()
 
 
-def _firebase_patch(path_parts: List[str], payload: Dict[str, Any]) -> None:
-    url = _fb_url(*path_parts)
-    r = requests.patch(url, json=payload, timeout=FIREBASE_TIMEOUT_S)
-    r.raise_for_status()
-
-
 def upload_detection_to_firebase(*, lat: float, lng: float, class_name: str, confidence: float) -> None:
     """
     Writes to:
@@ -258,55 +238,48 @@ def upload_detection_to_firebase(*, lat: float, lng: float, class_name: str, con
         Classes, Contributor, Location, ReportCount, Confidence
       }
 
-    - Each NEW detection gets its own index
-    - BUT if within DUPLICATE_RADIUS_M of an existing entry with same Classes,
-      increment that entry's ReportCount instead of adding a new one.
+    - Always APPENDS a new numeric index (no merging).
+    - Fixes the “keeps writing under 0” bug by handling dict OR list JSON returns.
     """
+    if not FIREBASE_DB_URL:
+        # Fail fast so you see it in logs if env var isn't set
+        raise RuntimeError("FIREBASE_DB_URL env var not set.")
+
     chunk = _chunk_key(lat, lng)
     location = _location_string(lat, lng)
     class_norm = str(class_name).lower().strip()
 
-    # Base path: ["detectRoundChunk", "40@4, -74@5"]
     chunk_path = [FIREBASE_ROOT_NODE, chunk]
 
-    existing = _firebase_get(chunk_path) or {}
+    existing = _firebase_get(chunk_path)
 
-    # 1) If a nearby match exists (same class, within N meters), increment ReportCount
-    if isinstance(existing, dict):
-        for k, v in existing.items():
-            if not isinstance(v, dict):
-                continue
-            if str(v.get("Classes", "")).lower().strip() != class_norm:
-                continue
+    # Compute next numeric index robustly
+    next_index_int = 0
 
-            ex_loc = _parse_location_string(v.get("Location", ""))
-            if ex_loc is None:
-                continue
+    if existing is None:
+        next_index_int = 0
 
-            ex_lat, ex_lng = ex_loc
-            if haversine_m(lat, lng, ex_lat, ex_lng) <= DUPLICATE_RADIUS_M:
-                current = int(v.get("ReportCount", 0) or 0)
-                # Keep Confidence updated to the max we've seen (optional but useful)
-                try:
-                    old_conf = float(v.get("Confidence", 0.0) or 0.0)
-                except Exception:
-                    old_conf = 0.0
-                new_conf = float(round(float(confidence), 3))
-                _firebase_patch(
-                    chunk_path + [str(k)],
-                    {"ReportCount": current + 1, "Confidence": max(old_conf, new_conf)}
-                )
-                return
-
-    # 2) Otherwise append at next numeric index
-    numeric_keys: List[int] = []
-    if isinstance(existing, dict):
+    elif isinstance(existing, dict):
+        numeric_keys: List[int] = []
         for k in existing.keys():
             try:
                 numeric_keys.append(int(k))
             except Exception:
                 pass
-    next_idx = str((max(numeric_keys) + 1) if numeric_keys else 0)
+        next_index_int = (max(numeric_keys) + 1) if numeric_keys else 0
+
+    elif isinstance(existing, list):
+        # Firebase can return list when keys are 0..N.
+        # Append after last non-null element.
+        last_used = -1
+        for i, item in enumerate(existing):
+            if item is not None:
+                last_used = i
+        next_index_int = last_used + 1  # if all None -> 0
+
+    else:
+        # Unexpected type; avoid crash
+        next_index_int = 0
 
     payload = {
         "Classes": class_norm,
@@ -315,7 +288,8 @@ def upload_detection_to_firebase(*, lat: float, lng: float, class_name: str, con
         "ReportCount": 1,
         "Confidence": float(round(float(confidence), 3)),
     }
-    _firebase_put(chunk_path + [next_idx], payload)
+
+    _firebase_put(chunk_path + [str(next_index_int)], payload)
 
 
 # ----------------------------
@@ -399,7 +373,7 @@ def scan_route(req: RouteScanRequest):
                         )
                     )
 
-                    # ✅ Firebase upload only if >= 0.60 confidence
+                    # ✅ Firebase upload only if >= FIREBASE_MIN_CONF confidence
                     if conf >= FIREBASE_MIN_CONF:
                         try:
                             upload_detection_to_firebase(
@@ -408,9 +382,9 @@ def scan_route(req: RouteScanRequest):
                                 class_name=class_name,
                                 confidence=conf,
                             )
-                        except Exception:
-                            # Don't break the API response if Firebase errors
-                            pass
+                        except Exception as e:
+                            # Extra change: log the error instead of silently swallowing it
+                            print("Firebase upload failed:", repr(e))
 
     # 4) Return: pothole “waypoints” + the sampled route points (so MIT can compare along navigation)
     sampled_points_payload = [{"lat": float(a), "lng": float(b)} for (a, b) in sampled]
